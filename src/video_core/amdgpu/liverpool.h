@@ -8,6 +8,7 @@
 #include <coroutine>
 #include <exception>
 #include <mutex>
+#include <semaphore>
 #include <span>
 #include <thread>
 #include <vector>
@@ -914,7 +915,7 @@ struct Liverpool {
         }
 
         size_t GetColorSliceSize() const {
-            const auto num_bytes_per_element = NumBits(info.format) / 8u;
+            const auto num_bytes_per_element = NumBitsPerBlock(info.format) / 8u;
             const auto slice_size =
                 num_bytes_per_element * (slice.tile_max + 1) * 64u * NumSamples();
             return slice_size;
@@ -1179,8 +1180,16 @@ struct Liverpool {
     };
 
     union GsMode {
+        enum class Mode : u32 {
+            Off = 0,
+            ScenarioA = 1,
+            ScenarioB = 2,
+            ScenarioG = 3,
+            ScenarioC = 4,
+        };
+
         u32 raw;
-        BitField<0, 3, u32> mode;
+        BitField<0, 3, Mode> mode;
         BitField<3, 2, u32> cut_mode;
         BitField<22, 2, u32> onchip;
     };
@@ -1504,14 +1513,32 @@ public:
         rasterizer = rasterizer_;
     }
 
-    void SendCommand(Common::UniqueFunction<void>&& func) {
-        std::scoped_lock lk{submit_mutex};
-        command_queue.emplace(std::move(func));
-        ++num_commands;
-        submit_cv.notify_one();
+    template <bool wait_done = false>
+    void SendCommand(auto&& func) {
+        if (std::this_thread::get_id() == gpu_id) {
+            return func();
+        }
+        if constexpr (wait_done) {
+            std::binary_semaphore sem{0};
+            {
+                std::scoped_lock lk{submit_mutex};
+                command_queue.emplace([&sem, &func] {
+                    func();
+                    sem.release();
+                });
+                ++num_commands;
+                submit_cv.notify_one();
+            }
+            sem.acquire();
+        } else {
+            std::scoped_lock lk{submit_mutex};
+            command_queue.emplace(std::move(func));
+            ++num_commands;
+            submit_cv.notify_one();
+        }
     }
 
-    void reserveCopyBufferSpace() {
+    void ReserveCopyBufferSpace() {
         GpuQueue& gfx_queue = mapped_queues[GfxQueueId];
         std::scoped_lock<std::mutex> lk(gfx_queue.m_access);
 
@@ -1573,8 +1600,9 @@ private:
     Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
-    Task ProcessCompute(const u32* acb, u32 acb_dwords, u32 vqid);
+    Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 
+    void ProcessCommands();
     void Process(std::stop_token stoken);
 
     struct GpuQueue {
@@ -1618,6 +1646,7 @@ private:
     std::mutex submit_mutex;
     std::condition_variable_any submit_cv;
     std::queue<Common::UniqueFunction<void>> command_queue{};
+    std::thread::id gpu_id;
     int curr_qid{-1};
 };
 
